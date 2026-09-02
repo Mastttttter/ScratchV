@@ -44,7 +44,21 @@ Documentation = "https://github.com/kinsomwang/ScratchV/tree/main/docs"
 scratchv = "scratchv.main:main"
 
 [tool.setuptools.packages.find]
-include = ["scratchv", "scratchv.*", "scratchv_dag", "scratchv_dag.*", "benchmarks", "benchmarks.*"]
+include = [
+    "scratchv",
+    "scratchv.*",
+    "scratchv_dag",
+    "scratchv_dag.*",
+    "benchmarks",
+    "benchmarks.*",
+    "toy_peephole",
+    "toy_peephole.*",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "benchmarks"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.5",
+]

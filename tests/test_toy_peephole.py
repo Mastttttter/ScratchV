@@ -1,28 +1,72 @@
 """Tests for all 6 peephole rules (Toy Peephole Optimizer).
 
 Rules under test:
-  1. addi+addi fusion:  addi rd, rs, a; addi rd, rs, b → addi rd, rs, (a+b)
+  1. addi+addi fusion:  addi rd, rs, a; addi rd, rd, b → addi rd, rs, (a+b)
   2. li+addi fusion:    li rd, a; addi rd, rd, b → li rd, (a+b)
   3. beq x0→j:          beq x0/zero, x0/zero, label → j label
-  4. mv swap:           mv x,y; mv y,x → both deleted
-  5. mv chain:          mv a,b; mv c,a → mv c,b
-  6. addi zero:         addi rd, rs, 0 → delete
+  4. mv reverse copy:   mv x,y; mv y,x → keep the first copy
+  5. mv chain:          keep mv a,b; rewrite mv c,a → mv c,b
+  6. addi zero:         addi rd, rd, 0 → delete
 
-See docs/topics/toy-peephole/RULES.md for design rationale.
+See docs/topics/toy-peephole/02-rules-and-iteration.md for rationale.
 """
 
-from toy_peephole.demo01_parser import parse_asm, lines_to_asm
-from toy_peephole.demo02_engine import peephole_pass, get_default_rules
+from toy_peephole.demo01_parser import lines_to_asm, parse_asm, parse_line
+from toy_peephole.demo02_engine import get_default_rules, peephole_pass
 
 RULES = get_default_rules()  # 6 peephole rules
+
+
+# ---------------------------------------------------------------------------
+# Parser
+# ---------------------------------------------------------------------------
+
+
+class TestParser:
+    """Assembly text is parsed into the tuple format consumed by the engine."""
+
+    def test_instruction(self):
+        assert parse_line("addi x1, x2, 3") == (
+            "addi",
+            ["x1", "x2", "3"],
+        )
+
+    def test_label(self):
+        assert parse_line("main:") == (None, ["main"])
+
+    def test_comments_and_empty_lines_are_skipped(self):
+        asm = "\n# heading\naddi x1, x2, 3  # comment\n"
+        assert parse_asm(asm) == [("addi", ["x1", "x2", "3"])]
+
+    def test_inline_label(self):
+        assert parse_line("loop: addi x1, x1, -1") == (
+            (None, ["loop"]),
+            ("addi", ["x1", "x1", "-1"]),
+        )
+
+    def test_numeric_and_dollar_labels(self):
+        assert parse_line("1: addi x1, x1, -1") == (
+            (None, ["1"]),
+            ("addi", ["x1", "x1", "-1"]),
+        )
+        assert parse_line("$start:") == (None, ["$start"])
+
+    def test_quoted_directive_data(self):
+        directive = '.string "a,b#c"'
+        assert lines_to_asm([parse_line(directive)]) == f"  {directive}"
+
+    def test_round_trip(self):
+        asm = "main:\n  lw x1, 0(x2)\n  ret\n"
+        assert lines_to_asm(parse_asm(asm)) == ("main:\n  lw x1, 0(x2)\n  ret")
 
 
 # ---------------------------------------------------------------------------
 # Rule 1: addi+addi fusion
 # ---------------------------------------------------------------------------
 
+
 class TestAddiAddiFusion:
-    """addi rd, rs, a; addi rd, rs, b → addi rd, rs, (a+b)."""
+    """addi rd, rs, a; addi rd, rd, b → addi rd, rs, (a+b)."""
 
     def test_fusion_basic(self):
         """Two consecutive addi with same rd,rs → merged immediate."""
@@ -42,6 +86,29 @@ class TestAddiAddiFusion:
         assert changes >= 1
         output = lines_to_asm(result)
         assert "-2" in output  # 3 + (-5) = -2
+
+    def test_fusion_dependency_chain_with_distinct_source(self):
+        """The first source may differ from the shared destination."""
+        asm = "  addi x1, x2, 3\n  addi x1, x1, 5\n"
+        lines = parse_asm(asm)
+        result, changes, _ = peephole_pass(lines, RULES)
+        assert changes == 1
+        assert lines_to_asm(result) == "  addi x1, x2, 8"
+
+    def test_fusion_prefixed_immediates(self):
+        """Prefixed integer immediates are folded numerically."""
+        asm = "  addi x1, x1, 0x3\n  addi x1, x1, 0x5\n"
+        lines = parse_asm(asm)
+        result, changes, _ = peephole_pass(lines, RULES)
+        assert changes == 1
+        assert lines_to_asm(result) == "  addi x1, x1, 8"
+
+    def test_no_fusion_when_sum_exceeds_addi_range(self):
+        """A fused addi must retain a valid signed 12-bit immediate."""
+        asm = "  addi x1, x1, 2047\n  addi x1, x1, 1\n"
+        lines = parse_asm(asm)
+        _, changes, _ = peephole_pass(lines, RULES)
+        assert changes == 0
 
     def test_no_fusion_different_rd(self):
         """Different rd → no fusion (no data dependency)."""
@@ -68,6 +135,7 @@ class TestAddiAddiFusion:
 # ---------------------------------------------------------------------------
 # Rule 2: li+addi fusion
 # ---------------------------------------------------------------------------
+
 
 class TestLiAddiFusion:
     """li rd, a; addi rd, rd, b → li rd, (a+b)."""
@@ -110,6 +178,7 @@ class TestLiAddiFusion:
 # ---------------------------------------------------------------------------
 # Rule 3: beq x0/zero → j
 # ---------------------------------------------------------------------------
+
 
 class TestBeqToJ:
     """beq x0/zero, x0/zero, label → j label."""
@@ -163,6 +232,7 @@ class TestBeqToJ:
 # Label preservation
 # ---------------------------------------------------------------------------
 
+
 class TestLabelPreservation:
     """Labels before instructions are preserved after optimization."""
 
@@ -186,10 +256,34 @@ class TestLabelPreservation:
         assert "end:" in output
         assert "j end" in output
 
+    def test_inline_label_on_replaced_instruction(self):
+        """An inline control-flow target remains attached after replacement."""
+        asm = "loop: beq x0, x0, done\n"
+        lines = parse_asm(asm)
+        result, changes, _ = peephole_pass(lines, RULES)
+        assert changes == 1
+        assert lines_to_asm(result) == "loop:  j done"
+
+    def test_inline_label_on_deleted_instruction(self):
+        """Deleting a no-op instruction leaves its label behind."""
+        asm = "loop: addi x1, x1, 0\n"
+        lines = parse_asm(asm)
+        result, changes, _ = peephole_pass(lines, RULES)
+        assert changes == 1
+        assert lines_to_asm(result) == "loop:"
+
+    def test_no_fusion_across_inline_label(self):
+        """A target on the second instruction is a block boundary."""
+        asm = "  addi x1, x1, 3\nloop: addi x1, x1, 5\n"
+        lines = parse_asm(asm)
+        _, changes, _ = peephole_pass(lines, RULES)
+        assert changes == 0
+
 
 # ---------------------------------------------------------------------------
 # Multi-rule interaction
 # ---------------------------------------------------------------------------
+
 
 class TestMultiRule:
     """Multiple rules firing in a single pass."""
@@ -222,22 +316,30 @@ class TestMultiRule:
 # Rule 4: mv swap elimination
 # ---------------------------------------------------------------------------
 
+
 class TestMvSwap:
-    """mv x,y; mv y,x → both deleted."""
+    """mv x,y; mv y,x → keep the first copy and delete the redundant second."""
 
     def test_mv_swap(self):
-        """mv x,y; mv y,x → both deleted."""
+        """The reverse copy is redundant after the first copy."""
         asm = "  mv t0, t1\n  mv t1, t0\n"
         lines = parse_asm(asm)
         result, changes, _ = peephole_pass(lines, RULES)
-        assert changes >= 1
-        assert "mv" not in lines_to_asm(result)
+        assert changes == 1
+        assert lines_to_asm(result) == "  mv t0, t1"
 
     def test_no_swap_diff_regs(self):
         """mv x,y; mv x,z (different registers) → no match."""
         asm = "  mv t0, t1\n  mv t0, t2\n"
         lines = parse_asm(asm)
-        result, changes, _ = peephole_pass(lines, RULES)
+        _, changes, _ = peephole_pass(lines, RULES)
+        assert changes == 0
+
+    def test_zero_destination_is_not_optimized(self):
+        """Writing x0 does not establish the value used by the second move."""
+        asm = "  mv zero, t0\n  mv t0, zero\n"
+        lines = parse_asm(asm)
+        _, changes, _ = peephole_pass(lines, RULES)
         assert changes == 0
 
 
@@ -245,23 +347,30 @@ class TestMvSwap:
 # Rule 5: mv chain shortening
 # ---------------------------------------------------------------------------
 
+
 class TestMvChain:
-    """mv a,b; mv c,a → mv c,b."""
+    """Keep mv a,b and rewrite dependent mv c,a → mv c,b."""
 
     def test_mv_chain(self):
-        """mv a,b; mv c,a → mv c,b."""
+        """The first assignment stays live while the dependency is shortened."""
         asm = "  mv t0, t1\n  mv t2, t0\n"
         lines = parse_asm(asm)
         result, changes, _ = peephole_pass(lines, RULES)
-        assert changes >= 1
-        output = lines_to_asm(result)
-        assert "mv t2, t1" in output
+        assert changes == 1
+        assert lines_to_asm(result) == "  mv t0, t1\n  mv t2, t1"
 
     def test_no_chain_independent(self):
         """mv a,b; mv c,d (no data dep) → no match."""
         asm = "  mv t0, t1\n  mv t3, t4\n"
         lines = parse_asm(asm)
-        result, changes, _ = peephole_pass(lines, RULES)
+        _, changes, _ = peephole_pass(lines, RULES)
+        assert changes == 0
+
+    def test_zero_destination_is_not_forwarded(self):
+        """A write to x0 cannot feed the following move."""
+        asm = "  mv zero, t0\n  mv t1, zero\n"
+        lines = parse_asm(asm)
+        _, changes, _ = peephole_pass(lines, RULES)
         assert changes == 0
 
 
@@ -269,20 +378,28 @@ class TestMvChain:
 # Rule 6: addi zero elimination
 # ---------------------------------------------------------------------------
 
+
 class TestAddiZero:
-    """addi rd, rs, 0 → delete."""
+    """addi rd, rd, 0 is a no-op and may be deleted."""
 
     def test_addi_zero(self):
-        """addi rd, rs, 0 → delete."""
+        """Adding zero to the same register is redundant."""
         asm = "  addi x1, x1, 0\n"
         lines = parse_asm(asm)
         result, changes, _ = peephole_pass(lines, RULES)
-        assert changes >= 1
+        assert changes == 1
         assert "addi" not in lines_to_asm(result)
 
+    def test_addi_copy_not_deleted(self):
+        """addi rd, rs, 0 copies rs when the registers differ."""
+        asm = "  addi x1, x2, 0\n"
+        lines = parse_asm(asm)
+        _, changes, _ = peephole_pass(lines, RULES)
+        assert changes == 0
+
     def test_addi_nonzero_not_deleted(self):
-        """addi rd, rs, non-zero → kept."""
+        """addi rd, rd, non-zero → kept."""
         asm = "  addi x1, x1, 5\n"
         lines = parse_asm(asm)
-        result, changes, _ = peephole_pass(lines, RULES)
+        _, changes, _ = peephole_pass(lines, RULES)
         assert changes == 0
