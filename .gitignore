@@ -13,6 +13,7 @@ venv/
 .omo/
 scratchv.egg-info/
 benchmark_reports/
+/docs/mytopic/
 
 # Build artifacts at root (generated, never commit)
 /output.bin
