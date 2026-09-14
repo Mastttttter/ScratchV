@@ -218,6 +218,19 @@ jobs:
             --json benchmark_reports/const_merge_report.json \
             --markdown benchmark_reports/const_merge_report.md
 
+      # ── 课题18：固定用例执行验证与独立合成规模测试 ─────────────────
+      - name: Topic 18 scheduling case report
+        run: |
+          python3.12 -m benchmarks.run_inst_scheduler_case \
+            --json benchmark_reports/inst_scheduler_report.json \
+            --markdown benchmark_reports/inst_scheduler_report.md
+
+      - name: Topic 18 synthetic scheduling benchmark
+        run: |
+          python3.12 -m benchmarks.bench_inst_scheduler --repeats 3 \
+            --json benchmark_reports/inst_scheduler_synthetic.json \
+            --markdown benchmark_reports/inst_scheduler_synthetic.md
+
       # ── 3.2 DSL 用例编译 + 模拟基准 ────────────────────────────────────
       - name: DSL case compilation benchmarks
         run: |
@@ -240,6 +253,13 @@ jobs:
             "$MODEL" -o /tmp/cnn_riscv.bin \
             --asm benchmark_reports/cnn_scratchv.s \
             --estimate --report --const-merge
+
+      - name: Topic 18 CNN assembly scheduling A/B
+        run: |
+          python3.12 -m benchmarks.run_inst_scheduler_case \
+            benchmark_reports/cnn_scratchv.s --static-only \
+            --json benchmark_reports/inst_scheduler_cnn.json \
+            --markdown benchmark_reports/inst_scheduler_cnn.md
 
       # ── 3.3.1 汇编美化器：真实 CNN 输出 + Actions Summary ───────────
       - name: CNN assembly beautifier benchmark
@@ -363,6 +383,11 @@ jobs:
           if [ -f benchmark_reports/const_merge_report.md ]; then
             cat benchmark_reports/const_merge_report.md >> $GITHUB_STEP_SUMMARY
           fi
+          for report in inst_scheduler_report inst_scheduler_cnn inst_scheduler_synthetic; do
+            if [ -f "benchmark_reports/$report.md" ]; then
+              cat "benchmark_reports/$report.md" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
           echo "" >> $GITHUB_STEP_SUMMARY
           if [ -f benchmark_reports/github_summary.md ]; then
             cat benchmark_reports/github_summary.md >> $GITHUB_STEP_SUMMARY
