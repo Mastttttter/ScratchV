@@ -57,7 +57,7 @@ class CompilerConfig:
 
     backend: str = "riscv"
     optimize_level: str = "none"
-    reg_alloc: str = "linear"
+    reg_alloc: str = "greedy"
     dump_ir: bool = False
     verify: bool = False
     rtol: float = 1e-5
@@ -450,17 +450,25 @@ class CompilerDriver:
         selector = InstructionSelector(program)
         machine_instrs = selector.run()
 
-        # Linear-scan: skip greedy allocator, use liveness-driven allocator
+        # Linear-scan path: allocate on *unallocated* MachineInstrs.
+        # (Previously RegisterAllocator ran first with mode="linear", which
+        # fell through to greedy — so LinearScan never saw virtual regs.)
         if self.config.reg_alloc == "linear":
             from scratchv.backend.regalloc_linear import (
                 LinearScanAllocator, block_from_machine_instrs,
             )
             ls_insts = block_from_machine_instrs(machine_instrs)
             lsa = LinearScanAllocator()
-            return lsa.emit(ls_insts)
+            intervals = lsa.compute_live_intervals(ls_insts)
+            lsa.allocate(intervals)
+            return lsa.get_allocated_code(ls_insts)
 
-        alloc = RegisterAllocator(machine_instrs, mode=self.config.reg_alloc)
+        mode = self.config.reg_alloc if self.config.reg_alloc in (
+            "naive", "greedy",
+        ) else "greedy"
+        alloc = RegisterAllocator(machine_instrs, mode=mode)
         allocated = alloc.run()
+
         emitter = AsmEmitter(allocated)
         return emitter.emit()
 
@@ -479,7 +487,20 @@ class CompilerDriver:
         scheduler = DAGScheduler(dag)
         machine_instrs = scheduler.run()
 
-        alloc = RegisterAllocator(machine_instrs, mode=self.config.reg_alloc)
+        if self.config.reg_alloc == "linear":
+            from scratchv.backend.regalloc_linear import (
+                LinearScanAllocator, block_from_machine_instrs,
+            )
+            ls_insts = block_from_machine_instrs(machine_instrs)
+            lsa = LinearScanAllocator()
+            intervals = lsa.compute_live_intervals(ls_insts)
+            lsa.allocate(intervals)
+            return lsa.get_allocated_code(ls_insts)
+
+        mode = self.config.reg_alloc if self.config.reg_alloc in (
+            "naive", "greedy",
+        ) else "greedy"
+        alloc = RegisterAllocator(machine_instrs, mode=mode)
         allocated = alloc.run()
 
         emitter = AsmEmitter(allocated)
@@ -495,7 +516,11 @@ class CompilerDriver:
             opt = AsmPeepholeOptimizer()
             asm_text, changes = opt.optimize(asm_text)
             if changes:
-                warnings.append(f"Asm peephole: {changes} changes")
+                warnings.append(
+                    f"Asm peephole: {changes} changes, "
+                    f"{opt.instructions_saved} instr saved "
+                    f"({opt.instructions_before}->{opt.instructions_after})"
+                )
 
         if self.config.const_merge:
             from scratchv.backend.const_merge import merge_constants_detailed
