@@ -94,6 +94,7 @@ def bench_schedule(
         "unchanged_regions": sum(
             row["status"] == "no_improvement" for row in stats["regions"]
         ),
+        "sensitivity_rejected_regions": stats["sensitivity_rejected_regions"],
         "execution_verified": False,
         "model": stats["model"],
         "mean_s": statistics.mean(times),
@@ -108,8 +109,8 @@ def _markdown(records: list[dict]) -> str:
         "固定随机种子生成合法物理寄存器指令，单独统计优化器耗时和局部模型收益。",
         "这些数据不是实际工作负载；未执行汇编，也未测量硬件周期。",
         "",
-        "| 指令数 | 已建模 | 原序周期（估算） | 最终周期（估算） | 减少 | 移动指令 | 应用区域 | 无收益区域 | 跳过区域 | 耗时均值 ± 标准差（ms） |",
-        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| 指令数 | 已建模 | 原序周期（估算） | 最终周期（估算） | 减少 | 移动指令 | 应用区域 | 无收益区域 | 敏感性回退区域 | 跳过区域 | 耗时均值 ± 标准差（ms） |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in records:
         modeled = row["modeled"] > 0
@@ -118,7 +119,8 @@ def _markdown(records: list[dict]) -> str:
         saved = row["improvement"] if modeled else "N/A"
         lines.append(
             f"| {row['num_insts']} | {row['modeled']} | {before} | {after} | {saved} | "
-            f"{row['moved']} | {row['applied_regions']} | {row['unchanged_regions']} | {row['skipped']} | "
+            f"{row['moved']} | {row['applied_regions']} | {row['unchanged_regions']} | "
+            f"{row['sensitivity_rejected_regions']} | {row['skipped']} | "
             f"{row['mean_s'] * 1000:.3f} ± {row['stdev_s'] * 1000:.3f} |"
         )
     if records:

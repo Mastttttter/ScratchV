@@ -94,7 +94,7 @@ def test_three_register_dependencies_and_deduplication():
     nodes = graph("add t1, t0, t2\nmul t0, t3, t4\nadd t0, t0, t1")
     assert nodes[1].predecessors == [(nodes[0], 1)]
     assert nodes[1].edge_kinds[0] == {"WAR"}
-    assert nodes[2].predecessors == [(nodes[0], 1), (nodes[1], 3)]
+    assert nodes[2].predecessors == [(nodes[0], 1), (nodes[1], 4)]
     assert nodes[2].edge_kinds[1] == {"RAW", "WAW"}
     assert nodes[2].edge_kinds[0] == {"RAW"}
 
@@ -133,7 +133,7 @@ def test_fp_status_effects_are_ordered():
 
 def test_exact_heights_and_load_use_wait():
     nodes = graph("lw t0, 0(a0)\nmul t1, t0, t2\nadd t3, t1, t4")
-    assert [n.priority for n in nodes] == [6, 4, 1]
+    assert [n.priority for n in nodes] == [7, 5, 1]
     result = schedule_assembly(EXAMPLE, ScheduleConfig(strict=True))
     assert result.asm_text == EXPECTED
     assert result.stats["original_cycles"] == 5
@@ -148,19 +148,19 @@ def test_exact_heights_and_load_use_wait():
 def test_nonpipelined_divider_and_live_out_completion():
     instructions = parse_instructions("div t0, t1, t2\nadd t3, t4, t5\nrem t6, t1, t2")
     estimate = estimate_order(instructions)
-    assert estimate.issue_cycles == (0, 1, 16)
-    assert estimate.cycles == 32
-    assert estimate_order(instructions[:1]).cycles == 16
+    assert estimate.issue_cycles == (0, 33, 34)
+    assert estimate.cycles == 67
+    assert estimate_order(instructions[:1]).cycles == 33
 
 
-def test_resources_delay_without_starving_other_ready_instructions():
+def test_division_keeps_relative_order_and_blocks_issue_conservatively():
     scheduler = InstructionScheduler()
     nodes = scheduler.build_dag(
         parse_instructions("div t0, t1, t2\nrem t6, t1, t2\nadd t3, t4, t5")
     )
     result = scheduler.schedule(nodes)
-    assert [i.id for i in result] == [0, 2, 1]
-    assert estimate_order(result).issue_cycles == (0, 1, 16)
+    assert [i.id for i in result] == [0, 1, 2]
+    assert estimate_order(result).issue_cycles == (0, 33, 66)
 
 
 def test_custom_model_is_shared_and_copied():
@@ -282,7 +282,7 @@ def test_equal_or_worse_candidates_are_not_applied(monkeypatch):
         return [n.inst for n in reversed(dag)]
 
     monkeypatch.setattr(InstructionScheduler, "schedule", reverse)
-    for source in ("li t0, 1\nli t1, 2\n", "div t0, t1, t2\nli t3, 3\n"):
+    for source in ("li t0, 1\nli t1, 2\n", "mul t0, t1, t2\nli t3, 3\n"):
         result = schedule_assembly(source, ScheduleConfig(strict=True))
         assert result.asm_text == source
         assert result.stats["regions"][0]["status"] == "no_improvement"

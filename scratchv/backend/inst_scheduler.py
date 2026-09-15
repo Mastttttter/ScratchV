@@ -18,7 +18,7 @@ from typing import Sequence
 
 from ._asm_parser import ParsedAsmLine, parse_line
 from .schedule_model import ScheduleModel, estimate_order
-from .schedule_semantics import SchedInst, ScheduleError, integer, register_name
+from .schedule_semantics import DIVIDE, SchedInst, ScheduleError, integer, register_name
 from .schedule_verify import verify_schedule
 
 
@@ -41,7 +41,7 @@ class InstructionScheduler:
         latency_model: dict[str, int] | None = None,
         model: ScheduleModel | None = None,
     ):
-        if model is not None and latency_model is not None:
+        if model is not None and latency_model:
             raise ValueError("Choose a model or latency overrides, not both")
         self.model = model or ScheduleModel(overrides=latency_model or {})
         self.latency_model = dict(self.model.overrides)
@@ -84,7 +84,12 @@ class InstructionScheduler:
                 reads.setdefault(reg, set()).add(index)
             for reg in inst.defines:
                 if reg in writes:
-                    edge(writes[reg], index, 1, "WAW")
+                    producer = writes[reg]
+                    distance = max(
+                        1, self.model.timing(instructions[producer]).latency
+                        - self.model.timing(inst).latency,
+                    )
+                    edge(producer, index, distance, "WAW")
                 for reader in reads.get(reg, ()):
                     edge(reader, index, 1, "WAR")
                 reads[reg] = set()
@@ -104,6 +109,19 @@ class InstructionScheduler:
                 else:
                     edge(terminal, index, 1, "control")
                 terminal = index
+
+        # Division timing/dispatch behaviour differs substantially by target.
+        # Keep every div/rem on the same side of every other instruction until
+        # a target-specific policy is validated. Between anchors, normal list
+        # scheduling still applies. Only link each intervening interval once.
+        anchor = None
+        for index, inst in enumerate(instructions):
+            if anchor is not None:
+                edge(anchor, index, 1, "division-order")
+            if inst.opcode in DIVIDE:
+                for previous in range(0 if anchor is None else anchor + 1, index):
+                    edge(previous, index, 1, "division-order")
+                anchor = index
         for (a, b), (distance, kinds) in sorted(edges.items()):
             nodes[a].successors.append((nodes[b], distance))
             nodes[b].predecessors.append((nodes[a], distance))
@@ -173,7 +191,7 @@ class InstructionScheduler:
                 remaining[succ] -= 1
                 if remaining[succ] == 0:
                     heapq.heappush(pending, (succ.ready_time, order[succ], succ))
-            clock += 1
+            clock += timings[node].issue_occupancy
         return result
 
     def estimate_cycles(self, instructions: Sequence[SchedInst]) -> int:
@@ -198,29 +216,84 @@ class AssemblyLine:
     ending: str
     instruction: SchedInst | None
     executable: bool
+    diagnostic: str = ""
+
+
+def _code_outside_strings(raw: str) -> str:
+    """Mask quoted strings and remove comments before checking layout syntax."""
+    code = []
+    quoted = escaped = False
+    for char in raw:
+        if quoted:
+            code.append(" ")
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = False
+        elif char == "#":
+            break
+        elif char == '"':
+            quoted = True
+            code.append(" ")
+        else:
+            code.append(char)
+    return "".join(code)
 
 
 def _read_lines(asm_text: str) -> list[AssemblyLine]:
     """Keep source layout separately from executable, typed instructions."""
     result = []
     region = 0
-    executable = True
+    section = (".text", True)
+    previous_section = None
+    section_stack = []
+    section_flags = {".text": True}
     previous_terminal = False
     for index, raw in enumerate(asm_text.splitlines(keepends=True)):
         text = raw.rstrip("\r\n")
         ending = raw[len(text) :]
         parsed = parse_line(text, index)
+        # Standalone compiler listings also have display labels containing '/'.
+        # Preserve these as boundaries rather than counting them as opcodes.
+        display = _code_outside_strings(text).strip()
+        if parsed.label is None and re.fullmatch(r"[^\s:]+:", display):
+            parsed = ParsedAsmLine(raw=text, label=display[:-1], lineno=index)
+        message = ""
         if parsed.is_directive:
             op = parsed.opcode
-            if op in {"text", "data", "bss", "rodata"}:
-                executable = op == "text"
-            elif op == "section":
-                section = parsed.operands[0] if parsed.operands else ""
-                executable = section == ".text" or section.startswith(".text.")
-                if len(parsed.operands) > 1:
+            if op in {"text", "data", "bss", "rodata", "section", "pushsection"}:
+                if op == "pushsection":
+                    section_stack.append(section)
+                name = (
+                    "." + op if op in {"text", "data", "bss", "rodata"}
+                    else parsed.operands[0].strip('"') if parsed.operands else ""
+                )
+                executable = section_flags.get(
+                    name, name == ".text" or name.startswith(".text.")
+                )
+                if op in {"section", "pushsection"} and len(parsed.operands) > 1:
                     executable = "x" in parsed.operands[1].strip('"')
-            elif op in {"pushsection", "popsection", "previous"}:
-                executable = False
+                # Explicitly named data stays pinned even with unusual flags.
+                if any(name == prefix or name.startswith(prefix + ".")
+                       for prefix in (".data", ".bss", ".rodata", ".sdata", ".sbss")):
+                    executable = False
+                section_flags[name] = executable
+                previous_section, section = section, (name, executable)
+            elif op == "popsection":
+                if section_stack:
+                    previous_section, section = section, section_stack.pop()
+                else:
+                    section = ("", False)
+                    message = "unmatched .popsection; awaiting an explicit section"
+            elif op == "previous":
+                if previous_section is not None:
+                    section, previous_section = previous_section, section
+                else:
+                    section = ("", False)
+                    message = ".previous has no prior section; awaiting an explicit section"
+        executable = section[1]
         inst = None
         if parsed.label or parsed.is_directive or not parsed.opcode:
             region += 1
@@ -237,7 +310,7 @@ def _read_lines(asm_text: str) -> list[AssemblyLine]:
                 region += 1
         else:
             previous_terminal = False
-        result.append(AssemblyLine(parsed, ending, inst, executable))
+        result.append(AssemblyLine(parsed, ending, inst, executable, message))
     return result
 
 
@@ -279,12 +352,14 @@ class ScheduleResult:
             f"  Estimated cycles: {s['original_cycles']} -> {s['final_cycles']}\n"
             f"  Saved cycles: {s['saved_cycles']}; moved instructions: {s['moved_instructions']}\n"
             f"  Modeled instructions: {s['modeled_instructions']}/{s['input_instructions']}\n"
+            f"  Coverage: {s['coverage_ratio']:.1%}; unmodeled: {s['unmodeled_instructions']}\n"
+            f"  Region size: mean {s['mean_region_size']:.2f}, max {s['max_region_instructions']}\n"
             f"  Applied regions: {s['applied_regions']}; skipped: {s['skipped_regions']}\n"
             "  Regions assume ready inputs; this is not whole-program runtime."
         )
 
 
-def _unsafe_layout(lines: Sequence[AssemblyLine]) -> str | None:
+def _unsafe_layout(lines: Sequence[AssemblyLine]) -> tuple[int, str] | None:
     # These constructs can change the interpretation of later instructions.
     unsafe = {
         "macro",
@@ -307,15 +382,15 @@ def _unsafe_layout(lines: Sequence[AssemblyLine]) -> str | None:
     }
     for line in lines:
         p = line.parsed
-        code = p.raw.split("#", 1)[0]
+        code = _code_outside_strings(p.raw)
         if (
             ";" in code
             or "\\" in code
             or (p.opcode != "size" and re.search(r"(?<![\w.])\.(?![\w.])", code))
         ):
-            return "compound statement, continuation or current-address expression"
+            return p.lineno, "compound statement, continuation or current-address expression"
         if p.is_directive and (p.opcode in unsafe or (p.opcode or "").startswith("if")):
-            return "assembler macro, conditional or layout directive"
+            return p.lineno, "assembler macro, conditional or layout directive"
         if (
             line.instruction
             and line.instruction.terminator
@@ -325,13 +400,13 @@ def _unsafe_layout(lines: Sequence[AssemblyLine]) -> str | None:
                 and integer(p.operands[-1]) is not None
             )
         ):
-            return "numeric control-flow target"
+            return p.lineno, "numeric control-flow target"
         if (
             p.opcode in {"j", "jal"}
             and p.operands
             and integer(p.operands[-1]) is not None
         ):
-            return "numeric control-flow target"
+            return p.lineno, "numeric control-flow target"
     return None
 
 
@@ -340,6 +415,7 @@ def schedule_assembly(
 ) -> ScheduleResult:
     """Verify each candidate before applying it; errors restore the whole region."""
     config = config or ScheduleConfig()
+    sensitivity_model = config.model.sensitivity_model()
     started = time.perf_counter()
     lines = _read_lines(asm_text)
     output = [line.parsed.raw + line.ending for line in lines]
@@ -347,6 +423,10 @@ def schedule_assembly(
     stats = {
         "model": config.model.name,
         "model_overrides": dict(config.model.overrides),
+        "division_policy": "preserve-relative-order; conservative blocking issue",
+        "sensitivity_model": sensitivity_model.name,
+        "sensitivity_overrides": dict(sensitivity_model.overrides),
+        "sensitivity_rejected_regions": 0,
         "estimate_scope": "sum of local static regions; ready inputs; no cache/branch prediction",
         "input_instructions": sum(line.instruction is not None for line in lines),
         "modeled_instructions": 0,
@@ -364,9 +444,14 @@ def schedule_assembly(
     def diagnostic(line: int, reason: str, severity: str = "info") -> None:
         diagnostics.append({"line": line + 1, "reason": reason, "severity": severity})
 
+    for line in lines:
+        if line.diagnostic:
+            diagnostic(line.parsed.lineno, line.diagnostic, "warning")
+    modeled_ids: set[int] = set()
     unsafe = _unsafe_layout(lines)
     if unsafe:
-        diagnostic(0, unsafe + "; entire input preserved")
+        line, reason = unsafe
+        diagnostic(line, reason + "; entire input preserved", "warning")
         stats["skipped_regions"] = 1
     else:
         regions: list[list[SchedInst]] = []
@@ -415,15 +500,22 @@ def schedule_assembly(
                 verify_schedule(original, candidate, dag)
                 before = estimate_order(original, config.model)
                 after = estimate_order(candidate, config.model)
-                applied = after.cycles < before.cycles
+                sensitivity_before = estimate_order(original, sensitivity_model)
+                sensitivity_after = estimate_order(candidate, sensitivity_model)
+                sensitive = (after.cycles < before.cycles
+                             and sensitivity_after.cycles >= sensitivity_before.cycles)
+                applied = after.cycles < before.cycles and not sensitive
+                stats["sensitivity_rejected_regions"] += int(sensitive)
                 final = candidate if applied else original
                 verify_schedule(original, final, dag)
                 final_estimate = after if applied else before
                 row.update(
-                    status="applied" if applied else "no_improvement",
+                    status="applied" if applied else "model_sensitive" if sensitive else "no_improvement",
                     original_cycles=before.cycles,
                     candidate_cycles=after.cycles,
                     final_cycles=final_estimate.cycles,
+                    sensitivity_original_cycles=sensitivity_before.cycles,
+                    sensitivity_candidate_cycles=sensitivity_after.cycles,
                     original_issue_cycles=list(before.issue_cycles),
                     candidate_issue_cycles=list(after.issue_cycles),
                 )
@@ -438,6 +530,7 @@ def schedule_assembly(
                 for slot, inst in zip(original, final):
                     output[slot.id] = inst.raw_line + lines[slot.id].ending
                 stats["modeled_instructions"] += len(original)
+                modeled_ids.update(inst.id for inst in original)
                 stats["moved_instructions"] += row["moved"]
                 stats["applied_regions"] += int(applied)
                 stats["original_cycles"] += before.cycles
@@ -455,6 +548,28 @@ def schedule_assembly(
     result = "".join(output)
     stats["saved_cycles"] = stats["original_cycles"] - stats["final_cycles"]
     stats["output_instructions"] = stats["input_instructions"]
+    stats["unmodeled_instructions"] = stats["input_instructions"] - len(modeled_ids)
+    stats["coverage_ratio"] = (
+        len(modeled_ids) / stats["input_instructions"] if stats["input_instructions"] else 0.0
+    )
+    counts: dict[str, int] = {}
+    for line in lines:
+        if line.instruction is not None and line.instruction.id not in modeled_ids:
+            op = line.instruction.opcode
+            counts[op] = counts.get(op, 0) + 1
+    stats["unmodeled_by_opcode"] = dict(sorted(counts.items()))
+    sizes = [row["instructions"] for row in stats["regions"]]
+    stats["region_count"] = len(sizes)
+    stats["mean_region_size"] = sum(sizes) / len(sizes) if sizes else 0.0
+    stats["max_region_instructions"] = max(sizes, default=0)
+    if stats["unmodeled_instructions"]:
+        first = next(line for line in lines
+                     if line.instruction is not None and line.instruction.id not in modeled_ids)
+        diagnostic(first.parsed.lineno,
+                   f"scheduling coverage {stats['coverage_ratio']:.1%}; "
+                   f"{stats['unmodeled_instructions']}/{stats['input_instructions']} "
+                   "instructions unmodeled; see unmodeled_by_opcode and diagnostics",
+                   "warning")
     stats["elapsed_seconds"] = time.perf_counter() - started
     return ScheduleResult(result, stats, diagnostics, result != asm_text)
 

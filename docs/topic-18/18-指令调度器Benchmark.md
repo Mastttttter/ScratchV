@@ -1,10 +1,23 @@
 # 课题 18：Benchmark 与 CI 报告
 
-将固定功能用例、实际编译输出和合成规模测试分别展示。所有数字均由本次运行产生。
+状态：2026-09-16 review 迭代后的验证入口。将固定功能用例、实际编译输出、合成规模与独立 CPU 模型审计分别展示。前后对比结果见 [Review 迭代报告](18-指令调度器Review迭代报告.md)。
+
+## 环境准备
+
+从仓库根目录运行，推荐 Python 3.12（CI 基线）。下面的 `python` 指选定的解释器；使用已有虚拟环境前先检查版本，不能只凭 `.venv` 目录名认定兼容。
+
+```bash
+python --version
+python -m pip install -e '.[riscv]' 'pytest>=7,<10'
+```
+
+本次本地测试使用 Python 3.14.7；review 中的 Python 3.8 是评审方当时的环境，不是所有 checkout 的固定版本。项目包元数据仍声明较低的 Python 下限，但本报告不据此承诺全部模块兼容 3.8。
+
+真实 RISC-V 执行测试还需要 `clang`、`ld.lld` 和 `qemu-riscv32`；独立性能审计需要带 RISC-V 支持的 `llvm-mca`。Ubuntu CI 安装 `clang-18 lld-18 llvm-18 qemu-user`。
 
 ## 固定功能用例：编译器集成与真实执行
 
-在仓库根目录运行（本地虚拟环境可使用 `.venv/bin/python`）：
+完成上述环境准备后运行：
 
 ```bash
 python -m benchmarks.run_inst_scheduler_case
@@ -34,6 +47,16 @@ python -m benchmarks.run_inst_scheduler_case
 
 ## 实际编译输出：同一份汇编的静态 A/B
 
+先生成待比较的汇编。以下命令依赖上面的 editable 安装；已有 CNN 模型时直接使用，缺失时才生成最小模型：
+
+```bash
+mkdir -p benchmark_reports models/graph
+test -f models/graph/cnn.onnx || python scripts/gen_minimal_cnn.py
+PYTHONPATH=. python scratchv/standalone/onnx_to_riscv_standalone.py \
+  models/graph/cnn.onnx -o /tmp/topic18-cnn.bin \
+  --asm benchmark_reports/cnn_scratchv.s --estimate --report --const-merge
+```
+
 ```bash
 python -m benchmarks.run_inst_scheduler_case \
   benchmark_reports/cnn_scratchv.s --static-only \
@@ -45,7 +68,9 @@ python -m benchmarks.run_inst_scheduler_case \
 
 `--static-only` 的 JSON 类型为 `assembly-ab`，执行状态为 `not_run`，`output_equal` 为 `null`。它不声称 CNN 已经端到端执行，也不报告未经编码或执行测量的机器码大小和动态指令数。零收益是有效测量结果，不导致失败；没有指令被建模时，Markdown 中的周期和停顿显示 `N/A`。
 
-`status=passed` 表示报告运行和相应校验通过；`comparison_status` 单独区分 `changed`（已换序）、`no_improvement`（无收益）和 `not_modeled`（未建模）。当前 standalone CNN 列表包含数字分支偏移，例如 `bne t4, zero, -48`，会触发调度器的整份输入保留规则。本地报告因此为 `not_modeled`，不能解释为 CNN 加速或已完成 CNN 执行验证。源指令数不计入 `_op_/layer1/Conv:` 这类显示标签，JSON 的 `scheduling` 保留调度器原始诊断与计数。
+`status=passed` 表示报告运行和相应校验通过；`comparison_status` 单独区分 `changed`（已换序）、`no_improvement`（无收益）和 `not_modeled`（未建模）。当前 standalone CNN 列表包含数字分支偏移，例如 `bne t4, zero, -48`，会触发调度器的整份输入保留规则。本地报告因此为 `not_modeled`，不能解释为 CNN 加速或已完成 CNN 执行验证。
+
+源指令数与 `scheduling.input_instructions` 现在使用同一个计数入口：统计执行段指令行，不计 `_op_/layer1/Conv:` 等显示标签、指示行和数据段。保留未知 opcode 与伪指令，一条伪指令行计为一条源指令。这不是编码后的机器指令数。
 
 ## 合成规模测试
 
@@ -58,6 +83,22 @@ python -m benchmarks.bench_inst_scheduler --repeats 3 \
 使用固定种子 42，覆盖 10、50、100、200、500、1000、5000 条指令。默认区域上限为 1024，因此 5000 条的整块用例跳过并显示 `N/A`；可用 `--max-region-size` 调整上限。
 
 JSON 继续使用数组格式并保留原有统计字段，新增 `benchmark_type=synthetic`、输入哈希、种子、重复次数、区域上限、区域数量与 `execution_verified=false`。原有周期字段仍为模型对已覆盖区域的求和；必须结合 `modeled` 和 `skipped` 解读，不能将未建模的零计数当作完整程序耗时。
+
+本轮新增 `sensitivity_rejected_regions`：主模型预测收益、另一组延迟预测无收益时保留原序，单独计数。不要继续使用旧模型的 240→187 等数字描述本版。
+
+## 独立性能与真实覆盖审计
+
+```bash
+python -m benchmarks.audit_inst_scheduler --llvm-mca llvm-mca-18
+```
+
+可将工具参数替换为本机 `llvm-mca` 的路径。本次本地使用 LLVM 22.1.8，CI 使用 LLVM 18；工具版本写入报告，跨版本数字不能直接混算。
+
+该入口复用 review 的 72 个合成样例（规模 10/50/100/200/500/1000，种子 42/1/2，依赖链 1/2/3/8），在 `rocket-rv32` 和 `sifive-e76` 上分别以 1 次迭代比较相同输入调度前后的输出。此外，用 greedy、linear 编译 `benchmarks/cases` 的全部编号 DSL 和 `models/graph/cnn.onnx`，记录所有文件的覆盖率，并用 MCA 检查已应用区域的指令体；固定终止指令不计入这种局部体估算。
+
+默认生成 `benchmark_reports/inst_scheduler_audit.json` 和 `.md`。工具缺失、编译失败、MCA 不支持输入均失败；合成数据要求每个 CPU 总节省 > 0 且胜例数 ≥ 负例数，真实已应用区域要求总节省 ≥ 0 且胜例数 ≥ 负例数。完整 JSON 保留负例、零收益、输入文件及汇编哈希、逐区域估算和诊断。总体通过不代表每个样例都变快。
+
+CI 的 `scheduler-review` job 单独安装工具链，设置 `SCRATCHV_REQUIRE_RISCV_EXECUTION=1`，使执行测试缺工具时直接失败；审计报告写入 Job Summary 并上传为 `scheduler-review-report` artifact。CI 缺少未跟踪的 CNN 模型时生成最小 CNN，它与本地已有模型可能不同，应结合哈希比较。
 
 ## 统计口径与 CI
 

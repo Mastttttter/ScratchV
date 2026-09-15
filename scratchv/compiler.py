@@ -546,7 +546,8 @@ class CompilerDriver:
                 if diagnostic["severity"] == "warning":
                     warnings.append(f"Schedule line {diagnostic['line']}: {diagnostic['reason']}")
             if self.config.schedule_report:
-                warnings.append(result.report())
+                if stats is not None:
+                    stats["schedule"]["report"] = result.report()
 
         if self.config.beautify_asm:
             from scratchv.backend.asm_beautifier import beautify_asm

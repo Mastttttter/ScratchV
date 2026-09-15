@@ -132,8 +132,8 @@ class TestInstructionScheduler:
         ]
         scheduler = InstructionScheduler()
         cycles = scheduler.estimate_cycles(insts)
-        # add(1) + mul(3) = 4
-        assert cycles == 4
+        # add(1) + mul(4) = 5 in the conservative v2 model.
+        assert cycles == 5
 
     def test_report(self):
         insts = [
@@ -154,7 +154,7 @@ class TestInstructionScheduler:
         ]
         scheduler = InstructionScheduler()
         dag = scheduler.build_dag(insts)
-        assert [node.priority for node in dag] == [5, 3]
+        assert [node.priority for node in dag] == [6, 4]
 
     def test_empty_input(self):
         scheduler = InstructionScheduler()

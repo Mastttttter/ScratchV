@@ -32,14 +32,9 @@ INITIAL_REGISTERS = {10: DATA_ADDRESS, 7: 7}  # a0, t2; other registers are zero
 
 
 def _instruction_count(source: str) -> int:
-    # Standalone listings contain labels such as _op_/layer1/Conv:. Their
-    # display names are not GAS identifiers, but they are not instructions.
-    return sum(
-        line.opcode is not None
-        and not line.is_directive
-        and not line.raw.split("#", 1)[0].strip().endswith(":")
-        for line in parse_asm(source)
-    )
+    # Same executable-section scope as scheduling.input_instructions, including
+    # unsupported opcodes and excluding directives, data and display labels.
+    return len(parse_instructions(source))
 
 
 def _execute(source: str) -> dict[str, Any]:

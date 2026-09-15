@@ -1,6 +1,7 @@
 """Compiler/CLI integration and real RISC-V assembly execution comparisons."""
 
 import json
+import os
 import random
 import shutil
 import subprocess
@@ -37,9 +38,9 @@ def test_actual_compiler_paths_use_scheduler(tmp_path, allocator, dag):
     assert result.success, result.errors
     assert result.stats["schedule"]["input_instructions"] > 0
     assert result.stats["schedule"]["modeled_instructions"] > 0
-    assert any("Scheduling Report" in warning for warning in result.warnings)
-    # Some existing paths emit .label or omit labels entirely. Preserve exactly
-    # what code generation supplied; instruction scheduling does not repair it.
+    assert "Scheduling Report" in result.stats["schedule"]["report"]
+    assert not any("Scheduling Report" in warning for warning in result.warnings)
+    # Preserve all lines supplied by code generation, including labels.
     assert Counter(result.output_text.splitlines()) == Counter(original.splitlines())
 
 
@@ -153,6 +154,8 @@ def test_composes_with_other_assembly_passes():
 def execute_riscv(tmp_path):
     """Use actual assembler/linker and CPU execution, never the IR executor."""
     if not shutil.which("clang") or not shutil.which("qemu-riscv32"):
+        if os.environ.get("SCRATCHV_REQUIRE_RISCV_EXECUTION") == "1":
+            pytest.fail("CI requires clang and qemu-riscv32; execution cannot be skipped")
         pytest.skip("RISC-V execution checks require clang and qemu-riscv32")
     sequence = 0
 
@@ -208,6 +211,21 @@ def execute_riscv(tmp_path):
         return ran.stdout
 
     return execute
+
+
+def test_linear_branch_target_executes_a_backward_loop(execute_riscv):
+    from scratchv.backend.machine_types import MachineInstr, MachineOp, MachineOperand
+    from scratchv.backend.regalloc_linear import LinearScanAllocator, block_from_machine_instrs
+
+    counter = MachineOperand.vreg("counter")
+    block = block_from_machine_instrs([
+        MachineInstr(MachineOp.LI, counter, MachineOperand.immediate(3)),
+        MachineInstr(MachineOp.LABEL, comment=".Lcounter"),
+        MachineInstr(MachineOp.ADDI, counter, counter, MachineOperand.immediate(-1)),
+        MachineInstr(MachineOp.BNEZ, counter, comment=".Lcounter"),
+    ])
+    assembly = LinearScanAllocator(phys_regs=["t0"]).emit(block)
+    assert execute_riscv(assembly) == execute_riscv("li t0, 0\n")
 
 
 @pytest.mark.parametrize(

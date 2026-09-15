@@ -270,6 +270,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  optimizer: {result.stats['opt_message']}", file=sys.stderr)
         if result.stats.get("cycle_report"):
             print(result.stats["cycle_report"], file=sys.stderr)
+        if result.stats.get("schedule", {}).get("report"):
+            print(result.stats["schedule"]["report"], file=sys.stderr)
 
         # Verification
         if args.verify:
